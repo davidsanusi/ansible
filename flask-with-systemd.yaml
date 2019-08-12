@@ -1,0 +1,263 @@
+---
+# This playbook sets up an Ubuntu EC2 instance with python, nginx, flask, deploys a sample app and manages the service with systemd
+- hosts: nodes
+  gather_facts: false
+  pre_tasks:
+    # Bootstrap an Ubuntu instance with python2
+    # Note that this playbook has been written specifically for Ubuntu
+    # use this to fix python not available on AWS EC2 instances or any instance at all
+    - name: Bootstrap target(s) with python
+      become: yes
+      raw: test -e /usr/bin/python || (apt -y update && apt install -y python-minimal ruby wget)
+
+    # - name: Install AWS CodeDeploy agent 
+    #   become: yes 
+    #   raw: apt install -y ruby wget && wget https://aws-codedeploy-eu-west-1.s3.eu-west-1.amazonaws.com/latest/install && chmod +x ./install && bash install auto     
+
+    # - name: Get OS distro
+    #   command: lsb_release -s -c
+    #   register: get_distro
+
+# Set variables here to whatever you are using in your environment      
+  vars:
+   appuser: cyferweb
+   appname: cyferlabswebsite
+   node_version: node_10.x
+   node_env: staging
+   node_port: 3000
+
+  connection: ssh
+  tasks:
+  # # Start codedeploy-agent service
+  #  - name: Start codedeploy-agent
+  #    become: yes
+  #    systemd:
+  #     state: started
+  #     daemon_reload: no
+  #     name: codedeploy-agent
+  #     enabled: yes
+
+  # Create APPLICATION USER
+   - name: Add user {{ appuser }} to the remote server
+     become: yes
+     become_method: sudo
+     user:
+       name: "{{ appuser }}"
+       comment: "App User"
+       groups: sudo
+       shell: /bin/bash
+       # generate_ssh_key: yes
+       # ssh_key_bits: 2048
+       # ssh_key_file: .ssh/id_rsa
+
+  # Grant passwordless sudo access to application user
+   - name: Grant user passwordless sudo access
+     become: yes
+     lineinfile:
+       path: /etc/sudoers.d/{{ appuser }}
+       line: '{{ appuser }} ALL=(ALL) NOPASSWD: ALL'
+       create: yes
+       state: present
+
+   - name: Creates {{ appname }} directory
+     become: yes
+     file:
+      path: /home/{{ appuser }}/{{ appname }}
+      state: directory
+      owner: "{{ appuser }}"
+      group: "{{ appuser }}"
+      mode: 0775
+
+  # Deploy a sample app
+   - name: Deploy sample placeholder app for {{ appname }} 
+     become: yes
+     blockinfile:
+       path: /home/{{ appuser }}/{{ appname }}/app.py
+       create: yes
+       state: present
+       block: |
+                from flask import Flask
+                app = Flask(__name__)
+
+                @app.route('/')
+                def hello():
+                    return "Hello World!"
+
+                @app.route('/login')
+                def hello():
+                  return "Login to this host:" + socket.gethostname()
+
+                if __name__ == '__main__':
+                    app.run()
+
+# Change permission for app.py
+   - name: Change permission for app.py
+     become: yes
+     file:
+      path: /home/{{ appuser }}/{{ appname }}/app.py
+      # state: present
+      owner: "{{ appuser }}"
+      group: "{{ appuser }}"
+      mode: 0774              
+
+# Install and configure NGINX
+   - name: install nginx
+     become: yes
+     apt: name=nginx 
+
+   - name: Deploy nginx configuration
+     become: yes
+     blockinfile:
+       path: /etc/nginx/sites-available/{{ appname }}.conf
+       create: yes
+       state: present
+       block: |
+                server {
+                    listen 80;
+                    listen [::]:80;
+                    server_name _;
+
+
+                    # listen 443 ssl;
+
+                  # server_name _;
+                  # ssl_certificate /etc/nginx/ssl/certfile.crt;
+                  # ssl_certificate_key /etc/nginx/ssl/keyfile.key;
+
+
+                    location / {
+                        include uwsgi_params;
+                        uwsgi_pass unix:/home/{{ appuser }}/{{ appname }}/{{ appname }}.sock;
+                    }
+                }
+
+   - name: Disable default nginx virtualhost
+     become: yes
+     file: 
+        path: /etc/nginx/sites-enabled/default 
+        state: absent
+
+   - name: Enable nginx virtualhost for {{ appname }}
+     become: yes
+     file: 
+        src: /etc/nginx/sites-available/{{ appname }}.conf
+        dest: /etc/nginx/sites-enabled/{{ appname }}.conf
+        state: link
+
+   - name: Restart NGINX
+     become: yes
+     systemd:
+      name: nginx
+      state: restarted
+      daemon_reload: no
+      enabled: yes
+
+   - name: install python3-pip or python-setuptools
+     become: yes
+     apt: name=python3-pip
+
+   - name: install python-pip or python-setuptools
+     become: yes
+     apt: name=python-pip
+
+   - name: install python-venv
+     become: yes
+     apt: name=python3-venv
+
+   - name: Create requirements.txt file
+     become: yes
+     blockinfile:
+       path: /home/{{ appuser }}/{{ appname }}/requirements.txt
+       create: yes
+       owner: "{{ appuser }}"
+       group: "{{ appuser }}"
+       mode: 0755
+       state: present
+       block: |
+                Flask==1.0.3
+                python-dotenv==0.10.3
+                python-editor==1.0.4
+                uWSGI==2.0.18
+
+   - name: Install virtual environment and dependencies requirements
+     become: yes
+     pip: 
+       state: present
+       requirements: /home/{{ appuser }}/{{ appname }}/requirements.txt
+       virtualenv: /home/{{ appuser }}/{{ appname }}/env
+      #  virtualenv_python: python3
+       virtualenv_command: "/usr/bin/python3 -m venv"
+
+# Change permission for env folder
+   - name: Change permission for env
+     become: yes
+     file:
+      path: /home/{{ appuser }}/{{ appname }}/env
+      # state: present
+      owner: "{{ appuser }}"
+      group: "{{ appuser }}"
+      mode: 0775
+
+   - name: Create uwsgi ini file
+     become: yes
+     blockinfile:
+       path: /home/{{ appuser }}/{{ appname }}/{{ appname }}.ini
+       create: yes
+       owner: "{{ appuser }}"
+       group: "{{ appuser }}"
+       mode: 0754
+       state: present
+       block: |
+                [uwsgi]
+                module = {{ appname }}:app
+
+                master = true
+                processes = 5
+
+                socket = {{ appname }}.sock
+                chmod-socket = 660
+                vacuum = true
+
+                die-on-term = true
+
+   - name: Creates uwsgi log directory
+     become: yes
+     file:
+      path: /var/log/uwsgi
+      state: directory
+      owner: "{{ appuser }}"
+      group: www-data
+      mode: 0755
+
+# Create Systemd service for the app
+   - name: Deploy systemd service for {{ appname }}
+     become: yes
+     blockinfile:
+       path: /etc/systemd/system/{{ appname }}.service
+       create: yes
+       state: present
+       block: |
+                [Install]
+                WantedBy=multi-user.target
+
+                [Unit]
+                Description={{ appname }} uWSGI instance
+                After=network.target
+
+                [Service]
+                User={{ appuser }}
+                Group=www-data
+                WorkingDirectory=/home/{{ appuser }}/{{ appname }}
+                Environment="PATH=/home/{{ appuser }}/{{ appname }}/env/bin"
+                ExecStart=/home/{{ appuser }}/{{ appname }}/env/bin/uwsgi --ini {{ appname }}.ini --logger file:logfile=/var/log/uwsgi/{{ appname }}.log,maxsize=4000000 --lazy-app
+
+                [Install]
+                WantedBy=multi-user.target
+
+   - name: Start {{ appname }}
+     become: yes
+     systemd:
+      state: started
+      daemon_reload: yes
+      name: "{{ appname }}"
+      enabled: yes

@@ -1,0 +1,211 @@
+---
+# This playbook sets up an Ubuntu EC2 instance with node, nginx, deploys a sample app and manages the service with systemd
+- hosts: all
+  gather_facts: false
+  pre_tasks:
+    # Bootstrap an Ubuntu instance with python2
+    # Note that this playbook has been written specifically for Ubuntu
+    # use this to fix python not available on AWS EC2 instances or any instance at all
+    - name: Bootstrap target(s) with python
+      become: yes
+      raw: test -e /usr/bin/python || (apt -y update && apt install -y python-minimal ruby wget)
+
+    - name: Install AWS CodeDeploy agent 
+      become: yes 
+      raw: apt install -y ruby wget && wget https://aws-codedeploy-eu-west-1.s3.eu-west-1.amazonaws.com/latest/install && chmod +x ./install && bash install auto     
+
+    - name: Get OS distro
+      command: lsb_release -s -c
+      register: get_distro
+
+# Set variables here to whatever you are using in your environment      
+  vars:
+   appuser: sapp
+   appname: salaryadvance
+   node_version: node_10.x
+   node_env: staging
+   node_port: 3000
+
+  connection: ssh
+  tasks:
+  # Start codedeploy-agent service
+   - name: Start codedeploy-agent
+     become: yes
+     systemd:
+      state: started
+      daemon_reload: no
+      name: codedeploy-agent
+      enabled: yes
+
+  # Create APPLICATION USER
+   - name: Add user {{ appuser }} to the remote server
+     become: yes
+     become_method: sudo
+     user:
+       name: "{{ appuser }}"
+       comment: "App User"
+       groups: sudo
+       shell: /bin/bash
+       # generate_ssh_key: yes
+       # ssh_key_bits: 2048
+       # ssh_key_file: .ssh/id_rsa
+
+  # Grant passwordless sudo access to application user
+   - name: Grant user passwordless sudo access
+     become: yes
+     lineinfile:
+       path: /etc/sudoers.d/{{ appuser }}
+       line: '{{ appuser }} ALL=(ALL) NOPASSWD: ALL'
+       create: yes
+       state: present
+
+   - name: Creates {{ appname }} directory
+     become: yes
+     file:
+      path: /home/{{ appuser }}/{{ appname }}
+      state: directory
+      owner: "{{ appuser }}"
+      group: "{{ appuser }}"
+      mode: 0775
+
+# Deploy a sample app
+   # - name: Deploy placeholder app for {{ appname }} 
+   #   become: yes
+   #   copy: 
+   #      src: app.js 
+   #      dest: /home/{{ appuser }}/{{ appname }}/app.js 
+   #      owner: "{{ appuser }}"
+   #      group: "{{ appuser }}"
+   #      mode: 0774
+
+# Deploy a sample app
+   - name: Deploy sample placeholder app for {{ appname }} 
+     # become: yes
+     blockinfile:
+       path: /home/{{ appuser }}/{{ appname }}/app.js 
+       create: yes
+       state: present
+       block: |
+                const http = require('http');
+
+                const hostname = '127.0.0.1';
+                const port = 3000;
+
+                const server = http.createServer((req, res) => {
+                  res.statusCode = 200;
+                  res.setHeader('Content-Type', 'text/plain');
+                  res.end('Hello World from Ansible\n');
+                });
+
+                server.listen(port, hostname, () => {
+                  console.log(`Server running at http://${hostname}:${port}/`);
+                });
+
+# Change permission for app.js
+   - name: Change permission for {{ appname }}
+     become: yes
+     file:
+      path: /home/{{ appuser }}/{{ appname }}/app.js 
+      state: present
+      owner: "{{ appuser }}"
+      group: "{{ appuser }}"
+      mode: 0774              
+
+# Install Nodejs | Change version from vars section above
+   - name: Add apt key for nodesource
+     become: yes
+     apt_key: url=https://deb.nodesource.com/gpgkey/nodesource.gpg.key
+
+   - name: Add repo for node binary
+     become: yes
+     apt_repository:
+            repo: "deb https://deb.nodesource.com/{{ node_version }} {{ get_distro.stdout }} main" 
+            update_cache: yes
+
+   - name: Add repo for node source
+     become: yes
+     apt_repository:
+            repo: "deb-src https://deb.nodesource.com/{{ node_version }} {{ get_distro.stdout }} main"
+            update_cache: yes
+
+   - name: install nodejs
+     become: yes
+     apt: name=nodejs  
+
+# Install and configure NGINX
+   - name: install nginx
+     become: yes
+     apt: name=nginx 
+
+   - name: Deploy nginx configuration
+     become: yes
+     blockinfile:
+       path: /etc/nginx/sites-available/{{ appname }}.conf
+       create: yes
+       state: present
+       block: |
+                server {
+                    listen 80;
+                    server_name _;
+
+                    location / {
+                        proxy_pass http://localhost:3000;
+                    }
+                }
+
+   - name: Disable default nginx virtualhost
+     become: yes
+     file: 
+        path: /etc/nginx/sites-enabled/default 
+        state: absent
+
+   - name: Enable nginx virtualhost for {{ appname }}
+     become: yes
+     file: 
+        src: /etc/nginx/sites-available/{{ appname }}.conf
+        dest: /etc/nginx/sites-enabled/{{ appname }}.conf
+        state: link
+
+   - name: Restart NGINX
+     become: yes
+     systemd:
+      name: nginx
+      state: restarted
+      # daemon_reload: no
+      # enabled: yes
+
+# Create Systemd service for the app
+   - name: Deploy systemd service for {{ appname }}
+     become: yes
+     blockinfile:
+       path: /etc/systemd/system/{{ appname }}.service
+       create: yes
+       state: present
+       block: |
+                [Unit]
+                Description={{ appname }}
+                After=nginx.service
+
+                [Service]
+                ExecStart=/usr/bin/node /home/{{ appuser }}/{{ appname }}/app.js
+                WorkingDirectory=/home/{{ appuser }}/{{ appname }}
+                Restart=always
+                RestartSec=10
+                StandardOutput=syslog
+                StandardError=syslog
+                SyslogIdentifier={{ appname }}
+                User={{ appuser }}
+                Group={{ appuser }}
+                Environment=NODE_ENV={{ node_env }} 
+                Environment=PORT={{ node_port }}
+
+                [Install]
+                WantedBy=multi-user.target
+
+   - name: Start {{ appname }}
+     become: yes
+     systemd:
+      state: started
+      daemon_reload: yes
+      name: "{{ appname }}"
+      enabled: yes
