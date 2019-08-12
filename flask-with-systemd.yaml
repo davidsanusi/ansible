@@ -20,8 +20,8 @@
 
 # Set variables here to whatever you are using in your environment      
   vars:
-   appuser: cyferweb
-   appname: cyferlabswebsite
+   appuser: appuser
+   appname: appname
    node_version: node_10.x
    node_env: staging
    node_port: 3000
